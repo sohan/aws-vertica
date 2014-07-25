@@ -1,7 +1,7 @@
 aws-vertica  
 ===========
 
-Python script using Fabric and Boto to manage deploy of a Vertica cluster into AWS.
+Python script using Fabric and Boto to manage and deploy a Vertica cluster into AWS.
 
 It creates a standalone VPC environment. One node is designated as the Internet Gateway and
 the bootstrap node where the administrative commands are run.
