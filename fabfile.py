@@ -260,7 +260,7 @@ def __add_to_existing_cluster(bootstrap_ip, new_node_ips):
         run("ssh-keyscan {0} >> {1}/.ssh/known_hosts".format(ip, user_home))
 
     node_ip_list=','.join(new_node_ips)
-    sudo("/opt/vertica/sbin/install_vertica --add-hosts {node_ips} -i {key_path} --dba-user-password-disabled --point-to-point".format(node_ips=bootstrap_ip, key_path=CLUSTER_KEY_PATH))
+    sudo("/opt/vertica/sbin/install_vertica --add-hosts {node_ips} -i {key_path} --dba-user-password-disabled --point-to-point".format(node_ips=new_node_ips, key_path=CLUSTER_KEY_PATH))
 
     __set_fabric_env(bootstrap_ip, DB_USER)
 
