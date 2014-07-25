@@ -33,8 +33,6 @@ DB_PW = env.db_pw
 env.region_info=RegionInfo(name=env.region, endpoint='ec2.{0}.amazonaws.com'.format(env.region))
 env.disable_known_hosts = True
 
-env.key_filename = "/Users/sohan/.ssh/loc-sandbox-sjain.pem"
-
 CLUSTER_KEY_PATH="/etc/vertica/{0}.pem".format(env.key_pair)
 
 ec2_conn=ec2.connect_to_region(region_name=env.region)
