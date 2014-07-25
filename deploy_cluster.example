@@ -2,7 +2,7 @@
 Example output
 ==============
 
-$ fab --set region='us-east-1' deploy_cluster:total_nodes=3,eip_allocation_id=eipalloc-xxxxxxxx
+$ fab -c .fabricrc deploy_cluster:total_nodes=3,eip_allocation_id=eipalloc-xxxxxxxx
 Creating VPC...
 	VPC : vpc-xxxxxxxx
 Creating Subnet...

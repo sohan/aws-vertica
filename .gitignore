@@ -1,4 +1,7 @@
+.fabricrc
 *.py[cod]
+*.un~
+*.swp
 
 # C extensions
 *.so

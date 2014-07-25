@@ -5,27 +5,35 @@ from boto.ec2.regioninfo import RegionInfo
 from boto.exception import EC2ResponseError
 import os
 
-REGION_AMI_MAP={"us-east-1":"ami-1d048474"}
-INSTANCE_TYPE='m3.xlarge'
+AMI = env.ami # default in .fabricrc.sample is vertica 7 community edition
+INSTANCE_TYPE='m3.large'
 ACCESS_KEY=config.get(section="Credentials", name = "aws_access_key_id")
 SECRET_KEY=config.get(section="Credentials", name = "aws_secret_access_key")
-CLUSTER_LICENSE_PATH="/etc/vertica/vlicense"
-LOCAL_LICENSE_PATH="~/.aws/vlicense"
-LOCAL_PUBLIC_KEY="~/.ssh/id_rsa.pub"
+
+USE_COMMUNITY_EDITION_LICENSE=int(env.use_community_edition_license)
+if USE_COMMUNITY_EDITION_LICENSE:
+    CLUSTER_LICENSE_PATH = "/opt/vertica/config/licensing/vertica_community_edition.license.key"
+    LOCAL_LICENSE_PATH = None
+else:
+    CLUSTER_LICENSE_PATH = "/etc/vertica/vlicense"
+    LOCAL_LICENSE_PATH = env.local_license_path
+
+LOCAL_PUBLIC_KEY=env.local_public_key
 CLUSTER_USER="root"
-DB_USER="dbadmin"
+DB_USER=env.db_user
 AUTHORIZED_IP_BLOCKS_HTTP=['0.0.0.0/0']
 AUTHORIZED_IP_BLOCKS_SSH=['0.0.0.0/0']
 AUTHORIZED_IP_BLOCKS_DB=['0.0.0.0/0']
 DB_PATH="/vertica/data"
 DB_CATALOG="/vertica/data"
-DB_NAME="dw"
-DB_PW="MakeThisSecure!"
+
+DB_NAME = env.db_name
+DB_PW = env.db_pw
 
 env.region_info=RegionInfo(name=env.region, endpoint='ec2.{0}.amazonaws.com'.format(env.region))
-env.key_pair = env.cluster_name
+env.disable_known_hosts = True
 
-env.key_filename = "~/.aws/{0}/{1}.pem".format(env.region, env.key_pair)
+env.key_filename = "/Users/sohan/.ssh/loc-sandbox-sjain.pem"
 
 CLUSTER_KEY_PATH="/etc/vertica/{0}.pem".format(env.key_pair)
 
@@ -147,7 +155,7 @@ def deploy_cluster(total_nodes,  vpc_id=None, eip_allocation_id=None):
     print "Connect to the database:"
     print "\tvsql -U {0} -w {1} -h {2} -d {3}".format("dbadmin",DB_PW,bootstrap_instance.ip_address, DB_NAME)
 
-def __set_fabric_env(host,user):
+def __set_fabric_env(host, user):
     env.host=host
     env.user=user
     env.host_string="{0}@{1}:22".format(env.user, env.host)
@@ -192,6 +200,7 @@ def __setup_vertica(bootstrap):
     __copy_ssh_keys(host=bootstrap.ip_address,user=CLUSTER_USER)
     #transfer license file
     sudo("mkdir -p {0}".format(os.path.dirname(CLUSTER_LICENSE_PATH)))
+    sudo("mkdir -p {0}".format(os.path.dirname(CLUSTER_KEY_PATH)))
     #transfer pem key
     #if put works, remove s3cmd and put Put back in
     #sudo("s3cmd get --force s3://gaia-toolbox/{0}.pem /etc/vertica/".format(env.key_pair))
@@ -199,7 +208,8 @@ def __setup_vertica(bootstrap):
     
     #local("rsync -aC -e \"ssh -o StrictHostKeyChecking=no -i {0}\" {1} {2}@{3}:{4}".format(env.key_filename,env.key_filename,env.user,env.host,CLUSTER_KEY_PATH))
     put(local_path=env.key_filename,remote_path=CLUSTER_KEY_PATH,use_sudo=True,mirror_local_mode=True)
-    put(local_path=LOCAL_LICENSE_PATH,remote_path=CLUSTER_LICENSE_PATH,use_sudo=True)
+    if not USE_COMMUNITY_EDITION_LICENSE:
+        put(local_path=LOCAL_LICENSE_PATH,remote_path=CLUSTER_LICENSE_PATH,use_sudo=True)
     
     #authorize yourself for passwordless ssh
     #sudo("ssh-keygen -y -f {0} >> /{1}/.ssh/authorized_keys".format(CLUSTER_KEY_PATH,CLUSTER_USER))
@@ -216,6 +226,8 @@ def __setup_vertica(bootstrap):
     #make sure we can access the box
     __copy_ssh_keys(host=env.host,user=DB_USER)    
     __create_database(bootstrap)
+
+    # install udfs
 
 def __create_database(bootstrap):
     #create database
@@ -239,7 +251,7 @@ def __create_database(bootstrap):
 def __stitch_cluster(bootstrap_ip):
     user_home=__get_home(CLUSTER_USER)
     run("ssh-keyscan {0} >> {1}/.ssh/known_hosts".format(bootstrap_ip, user_home))
-    sudo("/opt/vertica/sbin/vcluster -s {node_ips} -L {license_path} -k {key_path}".format(node_ips=bootstrap_ip, license_path=CLUSTER_LICENSE_PATH, key_path=CLUSTER_KEY_PATH))
+    sudo("/opt/vertica/sbin/install_vertica --hosts {node_ips} -i {key_path} --dba-user-password-disabled --point-to-point".format(node_ips=bootstrap_ip, key_path=CLUSTER_KEY_PATH))
 
 def __add_to_existing_cluster(bootstrap_ip, new_node_ips):
     user_home=__get_home(CLUSTER_USER)
@@ -248,7 +260,7 @@ def __add_to_existing_cluster(bootstrap_ip, new_node_ips):
         run("ssh-keyscan {0} >> {1}/.ssh/known_hosts".format(ip, user_home))
 
     node_ip_list=','.join(new_node_ips)
-    sudo("/opt/vertica/sbin/vcluster -A {node_ips} -k {key_path}".format(node_ips=node_ip_list, key_path=CLUSTER_KEY_PATH))        
+    sudo("/opt/vertica/sbin/install_vertica --add-hosts {node_ips} -i {key_path} --dba-user-password-disabled --point-to-point".format(node_ips=bootstrap_ip, key_path=CLUSTER_KEY_PATH))
 
     __set_fabric_env(bootstrap_ip, DB_USER)
 
@@ -361,11 +373,10 @@ def authorize_security_group(vpc_id):
     for ip in AUTHORIZED_IP_BLOCKS_HTTP:
         __authorize_ip(sg,ip_protocol="tcp",from_port=80,to_port=80,cidr_ip=ip)
 
-
 def __deploy_node(subnet_id):
     """Deploy instance to specified subnet
     """
-    ami_image_id=REGION_AMI_MAP[env.region]
+    ami_image_id = AMI
 
     reservation = ec2_conn.run_instances(image_id=ami_image_id,
                                          instance_type=INSTANCE_TYPE,
@@ -394,6 +405,23 @@ def __deploy_node(subnet_id):
     instance.add_tag('ClusterName',env.cluster_name)
     instance.add_tag('NodeType','Vertica')
     instance.add_tag('Name','Vertica.'+env.cluster_name+'.'+instance.id)
+
     return instance
 
+def install_curl_udl(vpc_id):
+    bootstrap = __get_bootstrap_instance(vpc_id=vpc_id)
+    __set_fabric_env(bootstrap.ip_address, CLUSTER_USER)
+    with settings(warn_only=True):
+        sudo('cd /opt/vertica/sdk/examples && make')
+    _vsql_statement = lambda sql: 'vsql -U {0} -w {1} -h {2} -d {3} -c "{4}"'.format("dbadmin", DB_PW, bootstrap.ip_address, DB_NAME, sql)
+
+    run(_vsql_statement("CREATE LIBRARY curllib as '/opt/vertica/sdk/examples/build/cURLLib.so'"))
+    run(_vsql_statement("CREATE SOURCE curl AS LANGUAGE 'C++' NAME 'CurlSourceFactory' LIBRARY curllib"))
+
+def __install_udx_deps(instance):
+    #TODO: fix fabric env here so we can run this on every node in the cluster
+    __set_fabric_env(instance.ip_address, CLUSTER_USER)
+    sudo('yum install -y gcc-c++')
+    sudo('yum install -y curl')
+    sudo('yum install -y libcurl-devel')
 

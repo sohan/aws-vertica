@@ -1,0 +1,11 @@
+region=us-east-1
+ami=ami-e7b3b38e
+cluster_name=vertica_cluster
+key_pair=user
+key_filename=/home/user/.ssh/id_rsa
+local_public_key=/home/user/.ssh/id_rsa.pub
+use_community_edition_license=1
+local_license_path=/home/user/.aws/vlicense
+db_user=dbadmin
+db_name=dw
+db_pw=changeme
