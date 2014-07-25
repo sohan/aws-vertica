@@ -227,8 +227,6 @@ def __setup_vertica(bootstrap):
     __copy_ssh_keys(host=env.host,user=DB_USER)    
     __create_database(bootstrap)
 
-    # install udfs
-
 def __create_database(bootstrap):
     #create database
     __set_fabric_env(bootstrap.ip_address, DB_USER)
@@ -408,20 +406,22 @@ def __deploy_node(subnet_id):
 
     return instance
 
-def install_curl_udl(vpc_id):
-    bootstrap = __get_bootstrap_instance(vpc_id=vpc_id)
-    __set_fabric_env(bootstrap.ip_address, CLUSTER_USER)
-    with settings(warn_only=True):
-        sudo('cd /opt/vertica/sdk/examples && make')
-    _vsql_statement = lambda sql: 'vsql -U {0} -w {1} -h {2} -d {3} -c "{4}"'.format("dbadmin", DB_PW, bootstrap.ip_address, DB_NAME, sql)
-
-    run(_vsql_statement("CREATE LIBRARY curllib as '/opt/vertica/sdk/examples/build/cURLLib.so'"))
-    run(_vsql_statement("CREATE SOURCE curl AS LANGUAGE 'C++' NAME 'CurlSourceFactory' LIBRARY curllib"))
-
 def __install_udx_deps(instance):
-    #TODO: fix fabric env here so we can run this on every node in the cluster
     __set_fabric_env(instance.ip_address, CLUSTER_USER)
     sudo('yum install -y gcc-c++')
     sudo('yum install -y curl')
     sudo('yum install -y libcurl-devel')
+
+def install_curl_udl(vpc_id):
+    bootstrap = __get_bootstrap_instance(vpc_id=vpc_id)
+    __set_fabric_env(bootstrap.ip_address, CLUSTER_USER)
+
+    __install_udx_deps(bootstrap)
+
+    with settings(warn_only=True):
+        sudo('cd /opt/vertica/sdk/examples && make')
+    _vsql_statement = lambda sql: '/opt/vertica/bin/vsql -U {0} -w {1} -h {2} -d {3} -c "{4}"'.format("dbadmin", DB_PW, bootstrap.ip_address, DB_NAME, sql)
+
+    run(_vsql_statement("CREATE LIBRARY curllib as '/opt/vertica/sdk/examples/build/cURLLib.so'"))
+    run(_vsql_statement("CREATE SOURCE curl AS LANGUAGE 'C++' NAME 'CurlSourceFactory' LIBRARY curllib"))
 
