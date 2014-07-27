@@ -1,5 +1,6 @@
 region=us-east-1
 ami=ami-e7b3b38e
+instance_type=m3.xlarge
 cluster_name=vertica_cluster
 key_pair=user
 key_filename=/home/user/.ssh/id_rsa

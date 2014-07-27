@@ -6,7 +6,7 @@ from boto.exception import EC2ResponseError
 import os
 
 AMI = env.ami # default in .fabricrc.sample is vertica 7 community edition
-INSTANCE_TYPE='m3.large'
+INSTANCE_TYPE=env.instance_type
 ACCESS_KEY=config.get(section="Credentials", name = "aws_access_key_id")
 SECRET_KEY=config.get(section="Credentials", name = "aws_secret_access_key")
 
@@ -256,7 +256,7 @@ def __add_to_existing_cluster(bootstrap_ip, new_node_ips):
         run("ssh-keyscan {0} >> {1}/.ssh/known_hosts".format(ip, user_home))
 
     node_ip_list=','.join(new_node_ips)
-    sudo("/opt/vertica/sbin/install_vertica --add-hosts {node_ips} -i {key_path} --dba-user-password-disabled --point-to-point".format(node_ips=new_node_ips, key_path=CLUSTER_KEY_PATH))
+    sudo("/opt/vertica/sbin/install_vertica --add-hosts {node_ips} -i {key_path} --dba-user-password-disabled --point-to-point".format(node_ips=node_ip_list, key_path=CLUSTER_KEY_PATH))
 
     __set_fabric_env(bootstrap_ip, DB_USER)
 
