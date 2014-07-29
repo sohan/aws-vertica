@@ -137,8 +137,8 @@ def deploy_cluster(total_nodes,  vpc_id=None, eip_allocation_id=None):
             bootstrap_instance.update()
             time.sleep(10)
         print "\tElastic Ip: allocation_id:{0} public_ip:{1}".format(eip_allocation_id, bootstrap_instance.ip_address)
-        print "Waiting additional 30 seconds for safety"
-        time.sleep(30)
+        print "Waiting additional 45 seconds for safety"
+        time.sleep(45)
         authorize_security_group(vpc_id)
         #make sure we can access the box
         __copy_ssh_keys(host=bootstrap_instance.ip_address,user=CLUSTER_USER)
@@ -247,11 +247,11 @@ def __create_database(bootstrap):
 def __stitch_cluster(bootstrap_ip):
     user_home=__get_home(CLUSTER_USER)
     run("ssh-keyscan {0} >> {1}/.ssh/known_hosts".format(bootstrap_ip, user_home))
-    sudo("/opt/vertica/sbin/install_vertica --hosts {node_ips} -i {key_path} --dba-user-password-disabled --point-to-point".format(node_ips=bootstrap_ip, key_path=CLUSTER_KEY_PATH))
+    sudo("/opt/vertica/sbin/install_vertica --hosts {node_ips} -i {key_path} --dba-user-password-disabled --accept-eula --point-to-point".format(node_ips=bootstrap_ip, key_path=CLUSTER_KEY_PATH))
 
 def __add_to_existing_cluster(bootstrap_ip, new_node_ips):
     user_home=__get_home(CLUSTER_USER)
-    time.sleep(45) #wait for last node's ssh to come up
+    time.sleep(120) #wait for last node's ssh to come up
     for ip in new_node_ips:
         run("ssh-keyscan {0} >> {1}/.ssh/known_hosts".format(ip, user_home))
 
