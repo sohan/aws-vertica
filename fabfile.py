@@ -1,9 +1,15 @@
 from fabric.api import run,sudo,env,put,settings
 import time
 from boto import ec2,vpc,config
+import boto.ec2.blockdevicemapping
+import boto.ec2.networkinterface
 from boto.ec2.regioninfo import RegionInfo
 from boto.exception import EC2ResponseError
+from cuisine import package_ensure_yum, package_update_yum, group_ensure, user_ensure, group_user_ensure, file_write, mode_sudo
+import ipdb
+import re
 import os
+import paramiko
 
 AMI = env.ami # default in .fabricrc.sample is vertica 7 community edition
 INSTANCE_TYPE=env.instance_type
@@ -20,18 +26,23 @@ else:
 
 LOCAL_PUBLIC_KEY=env.local_public_key
 CLUSTER_USER="root"
+env.sudo_user = CLUSTER_USER
 DB_USER=env.db_user
 AUTHORIZED_IP_BLOCKS_HTTP=['0.0.0.0/0']
 AUTHORIZED_IP_BLOCKS_SSH=['0.0.0.0/0']
 AUTHORIZED_IP_BLOCKS_DB=['0.0.0.0/0']
-DB_PATH="/vertica/data"
-DB_CATALOG="/vertica/data"
+#DB_PATH="/vertica/data"
+#DB_CATALOG="/vertica/data"
+DB_PATH="/vol1/vertica/data"
+DB_CATALOG="/vol1/vertica/catalog"
 
 DB_NAME = env.db_name
 DB_PW = env.db_pw
 
 env.region_info=RegionInfo(name=env.region, endpoint='ec2.{0}.amazonaws.com'.format(env.region))
 env.disable_known_hosts = True
+env.connection_attempts = 30 #ssh takes forever to start up
+env.keepalive = 60
 
 CLUSTER_KEY_PATH="/etc/vertica/{0}.pem".format(env.key_pair)
 
@@ -39,6 +50,7 @@ ec2_conn=ec2.connect_to_region(region_name=env.region)
 vpc_conn=vpc.VPCConnection(region=env.region_info)
 node_filter={'tag:ClusterName': env.cluster_name, 'tag:NodeType':'Vertica'}
 vpc_node_filter={'tag:ClusterName': env.cluster_name}
+
 
 def print_status(show_all="False"):
     """Prints whats going on in AWS
@@ -132,7 +144,8 @@ def deploy_cluster(total_nodes,  vpc_id=None, eip_allocation_id=None):
             eip_allocation_id=ec2_conn.allocate_address(domain="vpc").allocation_id
         
         ec2_conn.associate_address(bootstrap_instance.id, None, eip_allocation_id)
-        while not bootstrap_instance.ip_address:
+        eip = ec2_conn.get_all_addresses(allocation_ids=[eip_allocation_id])[0]
+        while not bootstrap_instance.ip_address == eip.public_ip:
             print "Waiting for ip..."
             bootstrap_instance.update()
             time.sleep(10)
@@ -143,7 +156,6 @@ def deploy_cluster(total_nodes,  vpc_id=None, eip_allocation_id=None):
         #make sure we can access the box
         __copy_ssh_keys(host=bootstrap_instance.ip_address,user=CLUSTER_USER)
         __setup_vertica(bootstrap=bootstrap_instance)
-
 
     __make_cluster_whole(total_nodes=total_nodes,vpc_id=vpc_id)
     
@@ -177,6 +189,8 @@ def __make_cluster_whole(total_nodes, vpc_id):
     #Add nodes
     new_node_ips=[]
     #node_ips=[i.private_ip_address for i in existing_instances]
+    # TODO: deploy other cluster nodes in parallel!
+    # TODO: maybe deploy all nodes in parallel..?
     for i in range(0,int(total_nodes)-len(existing_instances)):
         new=__deploy_node(subnet_id=bootstrap_instance.subnet_id)
         new_node_ips.append(new.private_ip_address)
@@ -218,12 +232,21 @@ def __setup_vertica(bootstrap):
     #stitch cluster
     __stitch_cluster(bootstrap_ip=bootstrap.private_ip_address)
 
-    #create EULA acceptance file
-    sudo("echo 'S:a\nT:{0}\nU:500' > /opt/vertica/config/d5415f948449e9d4c421b568f2411140.dat".format(time.time()))
+    # create EULA acceptance file
+    # just use contents of a previously accepted file
+    eula_contents = '''
+    S:a
+    T:1406734602.82
+    U:500
+    EULA Hash:5aca8c197df7fda16c00b67bab0762ed
+    '''
+    eula_contents = re.sub('\n\s+', '\n', eula_contents)
+    file_write("/opt/vertica/config/d5415f948449e9d4c421b568f2411140.dat", eula_contents)
 
     #make sure we can access the box
     __copy_ssh_keys(host=env.host,user=DB_USER)    
     __create_database(bootstrap)
+    __add_storage_locations(bootstrap.ip_address)
 
 def __create_database(bootstrap):
     #create database
@@ -243,11 +266,35 @@ def __create_database(bootstrap):
     
     run("/opt/vertica/bin/adminTools -t create_db -s {bootstrap_ip} -d {db_name} -p {db_password} -l {license_path} -D {db_path} -c {db_catalog}".format(bootstrap_ip=bootstrap.private_ip_address, db_name=DB_NAME, db_password=DB_PW, license_path=CLUSTER_LICENSE_PATH, db_path=DB_PATH, db_catalog=DB_CATALOG))
 
+def __restart_db():
+    '/opt/vertica/bin/adminTools --tool stop_db -d dw -p bdJrxwUcdVqf9WN2 -F'
+    '/opt/vertica/bin/adminTools --tool stop_db -d dw -p bdJrxwUcdVqf9WN2 -F'
+
+def _vsql(bootstrap_ip, sql):
+    return run('/opt/vertica/bin/vsql -U {0} -w {1} -h {2} -d {3} -A -t -c "{4}"'.format("dbadmin", DB_PW, bootstrap_ip, DB_NAME, sql))
+
+def __add_storage_locations(bootstrap_ip):
+    '''
+    Add additional storage locations (/vol1 - /volN)
+    into vertica. run this from the bootstrap node
+    '''
+    __set_fabric_env(bootstrap_ip, CLUSTER_USER)
+    node_names = _vsql(bootstrap_ip, 'select node_name from v_catalog.nodes').split()
+    print 'trying to add additional storage locations. ok to see warnings below'
+    for node_name in node_names:
+        for vol in run('ls / | grep "vol[0-9]\+" | sort').split()[1:]:
+            with settings(warn_only=True):
+                _vsql(bootstrap_ip, "select add_location('/{0}/vertica/data', '{1}', 'DATA,TEMP')".format(vol, node_name))
 
 def __stitch_cluster(bootstrap_ip):
     user_home=__get_home(CLUSTER_USER)
     run("ssh-keyscan {0} >> {1}/.ssh/known_hosts".format(bootstrap_ip, user_home))
-    sudo("/opt/vertica/sbin/install_vertica --hosts {node_ips} -i {key_path} --dba-user-password-disabled --accept-eula --point-to-point".format(node_ips=bootstrap_ip, key_path=CLUSTER_KEY_PATH))
+    sudo("/opt/vertica/sbin/install_vertica --hosts {node_ips} -i {key_path} --dba-user-password {db_pw} --accept-eula --point-to-point --data-dir {data_dir} -L {license_file}".format(
+        node_ips=bootstrap_ip, 
+        db_pw=DB_PW, 
+        key_path=CLUSTER_KEY_PATH, 
+        license_file=CLUSTER_LICENSE_PATH,
+        data_dir=DB_PATH))
 
 def __add_to_existing_cluster(bootstrap_ip, new_node_ips):
     user_home=__get_home(CLUSTER_USER)
@@ -256,7 +303,7 @@ def __add_to_existing_cluster(bootstrap_ip, new_node_ips):
         run("ssh-keyscan {0} >> {1}/.ssh/known_hosts".format(ip, user_home))
 
     node_ip_list=','.join(new_node_ips)
-    sudo("/opt/vertica/sbin/install_vertica --add-hosts {node_ips} -i {key_path} --dba-user-password-disabled --point-to-point".format(node_ips=node_ip_list, key_path=CLUSTER_KEY_PATH))
+    sudo("/opt/vertica/sbin/install_vertica --add-hosts {node_ips} -i {key_path} --dba-user-password-disabled --point-to-point --data-dir {data_dir}".format(node_ips=node_ip_list, key_path=CLUSTER_KEY_PATH, data_dir=DB_PATH))
 
     __set_fabric_env(bootstrap_ip, DB_USER)
 
@@ -280,6 +327,8 @@ def __add_to_existing_cluster(bootstrap_ip, new_node_ips):
     #--script  Don't re-balance the data, just provide a script for later use.
     #TODO: rebalance prompts for password but nothing seems to work
     #run("/opt/vertica/bin/adminTools -t rebalance_data -d {db_name} -p {db_password} -k 1".format(db_name=DB_NAME, db_password=DB_NAME))   
+
+    __add_storage_locations(bootstrap_ip)
 
 def __get_home(user):
     if user==CLUSTER_USER:
@@ -369,15 +418,45 @@ def authorize_security_group(vpc_id):
     for ip in AUTHORIZED_IP_BLOCKS_HTTP:
         __authorize_ip(sg,ip_protocol="tcp",from_port=80,to_port=80,cidr_ip=ip)
 
+def __wait_for_ssh(ip_address):
+    _ssh_client = paramiko.SSHClient()
+    _ssh_client.load_system_host_keys()
+    _ssh_client.load_host_keys(os.path.expanduser('~/.ssh/known_hosts'))
+    _ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    retry = 0
+    while retry < 5:
+        try:
+            _ssh_client.connect(ip_address, username=CLUSTER_USER, pkey=env.key_filename,timeout=20)
+            return
+        except socket.error, (value, message):
+            if value in (51, 61, 111):
+                print 'SSH Connection refused, will retry in 5 seconds'
+
 def __deploy_node(subnet_id):
-    """Deploy instance to specified subnet
     """
-    ami_image_id = AMI
+    Deploy instance to specified subnet
+    """
+    ami_image_id = env.centos_pv_ami
+
+    device_mapping = boto.ec2.blockdevicemapping.BlockDeviceMapping()
+    for i in xrange(24): # at most 24 devices
+        eph = boto.ec2.blockdevicemapping.BlockDeviceType()
+        eph.ephemeral_name = 'ephemeral{0}'.format(i)
+        # create /dev/sdb - /dev/sdz
+        # actually gets mapped to /dev/xvdf - /dev/xvdN
+        device_mapping['/dev/sd{0}'.format(chr(ord('b') + i))] = eph
+
+    interface = boto.ec2.networkinterface.NetworkInterfaceSpecification(
+        subnet_id=subnet_id,
+        associate_public_ip_address=True
+    )
+    interfaces = boto.ec2.networkinterface.NetworkInterfaceCollection(interface)
 
     reservation = ec2_conn.run_instances(image_id=ami_image_id,
                                          instance_type=INSTANCE_TYPE,
                                          key_name=env.key_pair,
-                                         subnet_id=subnet_id)
+                                         network_interfaces=interfaces,
+                                         block_device_map=device_mapping)
 
     instance = reservation.instances[0]
     
@@ -397,18 +476,144 @@ def __deploy_node(subnet_id):
     time.sleep(45)
     print 'Successfully created node in EC2'
 
-    
     instance.add_tag('ClusterName',env.cluster_name)
     instance.add_tag('NodeType','Vertica')
     instance.add_tag('Name','Vertica.'+env.cluster_name+'.'+instance.id)
 
+    __configure_instance_for_vertica(instance)
+
     return instance
+
+def __configure_instance_for_vertica(instance):
+    '''
+    Install all dependencies, do sys configs, install vertica rpm.
+    '''
+
+    def _get_devices():
+        devices = sudo('''cat /proc/partitions |awk '{print $4}'|grep ^xv|grep -v "[0-9]"|grep -v xvde|sort''').split()
+        return ['/dev/{0}'.format(d) for d in devices]
+
+    def _format_disks():
+        print 'formatting instance stores with ext4 and mounting them'
+        mkfs_script = '''
+        DISKS=`cat /proc/partitions |awk '{print $4}'|grep ^xv|grep -v "[0-9]"|grep -v xvde|sort`
+        x=1
+        for dev in $DISKS; do 
+            mkdir /vol${x}
+            mkfs.ext4 "/dev/${dev}" 2>1 /tmp/mkfs.${dev}.log &
+            x=$((x+1))
+        done
+        wait
+        x=1
+        for dev in $DISKS; do
+            mount -t ext4 "/dev/${dev}" /vol${x}
+            echo "/dev/${dev} /vol${x} auto noatime 0 0" | tee -a /etc/fstab
+            newdir="/vol${x}/vertica"
+            mkdir -p "$newdir/data" && chown -R dbadmin:verticadba "$newdir" && chmod 770 -R "$newdir"
+            x=$((x+1))
+        done
+        '''
+        mkfs_script = re.sub('\n\s+', '\n', mkfs_script)
+        file_write('/root/mkfs.sh', mkfs_script)
+        sudo('bash /root/mkfs.sh')
+
+    def _add_swap_space():
+        #break if we've already configured swap
+        with settings(warn_only=True):
+            if sudo('swapon -s | grep swapfile'):
+                return
+        sudo('sudo dd if=/dev/zero of=/swapfile bs=1024 count=2048k')
+        sudo('mkswap /swapfile')
+        sudo('sudo swapon /swapfile')
+        sudo('echo "/swapfile swap swap defaults 0 0" | tee -a /etc/fstab')
+        sudo('chown root:root /swapfile')
+        sudo('chmod 0600 /swapfile')
+
+    def _install_packages():
+        for pkg in ['logrotate', 'rsync', 'pstack', 'mcelog', 'sysstat', 'vim', 'ntp', 'wget']:
+            package_ensure_yum(pkg)
+
+    def _manage_users():
+        group_ensure('verticadba')
+        user_ensure('dbadmin', home='/home/dbadmin', gid='verticadba')
+        group_user_ensure('verticadba', 'dbadmin')
+
+    def _tz():
+        package_ensure_yum('tzdata')
+        package_update_yum('tzdata')
+        sudo('echo export TZ="America/New_York" | tee -a /home/dbadmin/.bashrc')
+        sudo('echo export LANG="en_US.UTF-8" | tee -a /home/dbadmin/.bashrc')
+
+    def _disable_iptables():
+        sudo('service iptables save')
+        sudo('service iptables stop')
+        sudo('chkconfig iptables off')
+
+    def _security_limits():
+        sudo('echo dbadmin - nice 0 | tee -a /etc/security/limits.conf')
+        sudo('echo dbadmin - nofile 65536 | tee -a /etc/security/limits.conf')
+        sudo('echo dbadmin - as unlimited | tee -a /etc/security/limits.conf')
+        sudo('echo dbadmin - fsize unlimited | tee -a /etc/security/limits.conf')
+        sudo('echo dbadmin - nproc 4096 | tee -a /etc/security/limits.conf')
+        sudo('echo session required pam_limits.so | tee -a /etc/security/limits.conf')
+
+    def _readahead():
+        for dev in _get_devices() + ['/dev/xvde']:
+            sudo('/sbin/blockdev --setra 2048 {0}'.format(dev))
+            sudo('echo /sbin/blockdev --setra 2048 {0} | tee -a /etc/rc.local'.format(dev))
+
+    def _ntp():
+        sudo('/sbin/service ntpd restart')
+        sudo('/sbin/chkconfig ntpd on')
+
+    def _selinux():
+        file_write('/etc/selinux/config', 'SELINUX=disabled\nSELINUXTYPE=targeted')
+        sudo('setenforce 0')
+
+    def _hugepages():
+        with settings(warn_only=True):
+            sudo('echo \"if test -f /sys/kernel/mm/redhat_transparent_hugepage/enabled; then echo never > /sys/kernel/mm/redhat_transparent_hugepage/enabled; fi\" | tee -a /etc/rc.local')
+            sudo('echo never > /sys/kernel/mm/redhat_transparent_hugepage/enabled')
+
+    def _ioscheduler():
+        for dev in _get_devices() + ['/dev/xvde']:
+            dev_id = dev.replace('/dev/', '')
+            sudo('echo deadline > /sys/block/{0}/queue/scheduler'.format(dev_id))
+            sudo('echo \'echo deadline > /sys/block/{0}/queue/scheduler\' | tee -a /etc/rc.local'.format(dev_id))
+
+    def _awscli_conf():
+        sudo('wget http://peak.telecommunity.com/dist/ez_setup.py && python /root/ez_setup.py')
+        sudo('easy_install pip')
+        sudo('pip install awscli')
+
+    def _install_rpm():
+        sudo('AWS_ACCESS_KEY_ID={0} AWS_SECRET_ACCESS_KEY={1} aws s3 cp {2} vertica.rpm'.format(
+            ACCESS_KEY, SECRET_KEY, env.vertica_rpm_s3_url
+        ))
+        sudo('rpm -Uvh /root/vertica.rpm')
+
+    __set_fabric_env(instance.ip_address, CLUSTER_USER)
+    _install_packages()
+    _manage_users()
+    _tz()
+    _format_disks()
+    _add_swap_space()
+    _security_limits()
+    _selinux()
+    _disable_iptables()
+    _readahead()
+    _ntp()
+    _hugepages()
+    _ioscheduler()
+    _awscli_conf()
+    _install_rpm()
+    _readahead()
+    _ioscheduler()
 
 def __install_udx_deps(instance):
     __set_fabric_env(instance.ip_address, CLUSTER_USER)
-    sudo('yum install -y gcc-c++')
-    sudo('yum install -y curl')
-    sudo('yum install -y libcurl-devel')
+    for pkg in ['gcc-c++', 'curl', 'libcurl-devel']:
+        package_ensure_yum(pkg)
 
 def install_curl_udl(vpc_id):
     bootstrap = __get_bootstrap_instance(vpc_id=vpc_id)
@@ -418,8 +623,73 @@ def install_curl_udl(vpc_id):
 
     with settings(warn_only=True):
         sudo('cd /opt/vertica/sdk/examples && make')
-    _vsql_statement = lambda sql: '/opt/vertica/bin/vsql -U {0} -w {1} -h {2} -d {3} -c "{4}"'.format("dbadmin", DB_PW, bootstrap.ip_address, DB_NAME, sql)
 
-    run(_vsql_statement("CREATE LIBRARY curllib as '/opt/vertica/sdk/examples/build/cURLLib.so'"))
-    run(_vsql_statement("CREATE SOURCE curl AS LANGUAGE 'C++' NAME 'CurlSourceFactory' LIBRARY curllib"))
+    _vsql(bootstrap.private_ip_address, "CREATE LIBRARY curllib as '/opt/vertica/sdk/examples/build/cURLLib.so'")
+    _vsql(bootstrap.private_ip_address, "CREATE SOURCE curl AS LANGUAGE 'C++' NAME 'CurlSourceFactory' LIBRARY curllib")
+
+def test_vertica(vpc_id):
+    bootstrap_instance = __get_bootstrap_instance(vpc_id=vpc_id)
+    '''
+    __set_fabric_env(bootstrap_instance.ip_address, CLUSTER_USER)
+    __configure_instance_for_vertica(bootstrap_instance)
+    __copy_ssh_keys(host=bootstrap_instance.ip_address,user=CLUSTER_USER)
+    __setup_vertica(bootstrap=bootstrap_instance)
+
+    __make_cluster_whole(total_nodes=1,vpc_id=vpc_id)
+    '''
+    __add_storage_locations(bootstrap_instance.ip_address)
+    
+    print "Success!"
+    print "Connect to the bootstrap node:"
+    print "\tssh -i {0} {1}@{2}".format(env.key_filename, "root", bootstrap_instance.ip_address)
+    print "Connect to the database:"
+    print "\tvsql -U {0} -w {1} -h {2} -d {3}".format("dbadmin",DB_PW,bootstrap_instance.ip_address, DB_NAME)
+
+def test_deploy_cluster(total_nodes,  vpc_id=None, eip_allocation_id=None):
+    """Deploy Bootstrap node along with VPC, Subnet and Elastic IP
+       Add nodes to reach specified num_nodes
+       eip_allocation_id : Elastic IP Allocation ID if you want to re-use existing IP
+    """
+    
+    #get or create vpc
+    if not vpc_id:
+        sn_vpc=__create_vpc()
+        subnet=sn_vpc[0]
+        vpc_id=sn_vpc[1].id
+    
+    bootstrap_instance=__get_bootstrap_instance(vpc_id=vpc_id)
+    
+    '''
+    #deploy new bootstrap
+    print "\tInstance : id:{0} private_ip_address:{1}".format(bootstrap_instance.id, bootstrap_instance.private_ip_address)
+    
+    if not eip_allocation_id:
+        print "Creating and assigning elastic ip..."
+        eip_allocation_id=ec2_conn.allocate_address(domain="vpc").allocation_id
+    
+    ec2_conn.associate_address(bootstrap_instance.id, None, eip_allocation_id)
+    eip = ec2_conn.get_all_addresses(allocation_ids=[eip_allocation_id])[0]
+    #TODO: wait on some other thing
+    while not bootstrap_instance.ip_address == eip.public_ip:
+        print "Waiting for ip..."
+        bootstrap_instance.update()
+        time.sleep(10)
+    print "\tElastic Ip: allocation_id:{0} public_ip:{1}".format(eip_allocation_id, bootstrap_instance.ip_address)
+    #print "Waiting additional 45 seconds for safety"
+    #time.sleep(45)
+    #authorize_security_group(vpc_id)
+    #make sure we can access the box
+    #__copy_ssh_keys(host=bootstrap_instance.ip_address,user=CLUSTER_USER)
+    '''
+    #__setup_vertica(bootstrap=bootstrap_instance)
+    __set_fabric_env(bootstrap_instance.ip_address, DB_USER)
+
+    __make_cluster_whole(total_nodes=total_nodes,vpc_id=vpc_id)
+    
+    print "Success!"
+    print "Connect to the bootstrap node:"
+    print "\tssh -i {0} {1}@{2}".format(env.key_filename, "root", bootstrap_instance.ip_address)
+    print "Connect to the database:"
+    print "\tvsql -U {0} -w {1} -h {2} -d {3}".format("dbadmin",DB_PW,bootstrap_instance.ip_address, DB_NAME)
+
 
