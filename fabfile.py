@@ -33,8 +33,8 @@ AUTHORIZED_IP_BLOCKS_SSH=['0.0.0.0/0']
 AUTHORIZED_IP_BLOCKS_DB=['0.0.0.0/0']
 #DB_PATH="/vertica/data"
 #DB_CATALOG="/vertica/data"
-DB_PATH="/vol1/vertica/data"
-DB_CATALOG="/vol1/vertica/catalog"
+DB_PATH="/vertica/data"
+DB_CATALOG="/vertica/catalog"
 
 DB_NAME = env.db_name
 DB_PW = env.db_pw
@@ -246,7 +246,6 @@ def __setup_vertica(bootstrap):
     #make sure we can access the box
     __copy_ssh_keys(host=env.host,user=DB_USER)    
     __create_database(bootstrap)
-    __add_storage_locations(bootstrap.ip_address)
 
 def __create_database(bootstrap):
     #create database
@@ -277,6 +276,8 @@ def __add_storage_locations(bootstrap_ip):
     '''
     Add additional storage locations (/vol1 - /volN)
     into vertica. run this from the bootstrap node
+
+    DEPRECATED
     '''
     __set_fabric_env(bootstrap_ip, CLUSTER_USER)
     node_names = _vsql(bootstrap_ip, 'select node_name from v_catalog.nodes').split()
@@ -327,8 +328,6 @@ def __add_to_existing_cluster(bootstrap_ip, new_node_ips):
     #--script  Don't re-balance the data, just provide a script for later use.
     #TODO: rebalance prompts for password but nothing seems to work
     #run("/opt/vertica/bin/adminTools -t rebalance_data -d {db_name} -p {db_password} -k 1".format(db_name=DB_NAME, db_password=DB_NAME))   
-
-    __add_storage_locations(bootstrap_ip)
 
 def __get_home(user):
     if user==CLUSTER_USER:
@@ -494,28 +493,13 @@ def __configure_instance_for_vertica(instance):
         return ['/dev/{0}'.format(d) for d in devices]
 
     def _format_disks():
-        print 'formatting instance stores with ext4 and mounting them'
-        mkfs_script = '''
-        DISKS=`cat /proc/partitions |awk '{print $4}'|grep ^xv|grep -v "[0-9]"|grep -v xvde|sort`
-        x=1
-        for dev in $DISKS; do 
-            mkdir /vol${x}
-            mkfs.ext4 "/dev/${dev}" 2>1 /tmp/mkfs.${dev}.log &
-            x=$((x+1))
-        done
-        wait
-        x=1
-        for dev in $DISKS; do
-            mount -t ext4 "/dev/${dev}" /vol${x}
-            echo "/dev/${dev} /vol${x} auto noatime 0 0" | tee -a /etc/fstab
-            newdir="/vol${x}/vertica"
-            mkdir -p "$newdir/data" && chown -R dbadmin:verticadba "$newdir" && chmod 770 -R "$newdir"
-            x=$((x+1))
-        done
-        '''
-        mkfs_script = re.sub('\n\s+', '\n', mkfs_script)
-        file_write('/root/mkfs.sh', mkfs_script)
-        sudo('bash /root/mkfs.sh')
+        # create one raid controller for all ephemeral disks
+        put('scripts/raid_ephemeral.sh', '/root/raid_ephemeral.sh')
+        sudo('chmod +x /root/raid_ephemeral.sh')
+        sudo('bash /root/raid_ephemeral.sh')
+        sudo('mkdir -p /mnt/vertica/data')
+        sudo('chmod -R 770 /mnt/vertica')
+        sudo('chown -R dbadmin:verticadba /mnt/vertica')
 
     def _add_swap_space():
         #break if we've already configured swap
@@ -596,15 +580,15 @@ def __configure_instance_for_vertica(instance):
     _install_packages()
     _manage_users()
     _tz()
-    _format_disks()
     _add_swap_space()
+    _readahead()
+    _ioscheduler()
+    _format_disks()
     _security_limits()
     _selinux()
     _disable_iptables()
-    _readahead()
     _ntp()
     _hugepages()
-    _ioscheduler()
     _awscli_conf()
     _install_rpm()
     _readahead()
@@ -637,7 +621,6 @@ def test_vertica(vpc_id):
 
     __make_cluster_whole(total_nodes=1,vpc_id=vpc_id)
     '''
-    __add_storage_locations(bootstrap_instance.ip_address)
     
     print "Success!"
     print "Connect to the bootstrap node:"
