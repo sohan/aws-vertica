@@ -10,5 +10,4 @@ local_license_path=/home/user/.aws/vlicense
 db_user=dbadmin
 db_name=dw
 db_pw=changeme
-centos_pv_ami=ami-a96b01c0
 vertica_rpm_s3_url=s3://your_s3_bucket/vertica-7.0.1-0.x86_64.RHEL5.rpm

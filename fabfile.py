@@ -418,25 +418,11 @@ def authorize_security_group(vpc_id):
     for ip in AUTHORIZED_IP_BLOCKS_HTTP:
         __authorize_ip(sg,ip_protocol="tcp",from_port=80,to_port=80,cidr_ip=ip)
 
-def __wait_for_ssh(ip_address):
-    _ssh_client = paramiko.SSHClient()
-    _ssh_client.load_system_host_keys()
-    _ssh_client.load_host_keys(os.path.expanduser('~/.ssh/known_hosts'))
-    _ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    retry = 0
-    while retry < 5:
-        try:
-            _ssh_client.connect(ip_address, username=CLUSTER_USER, pkey=env.key_filename,timeout=20)
-            return
-        except socket.error, (value, message):
-            if value in (51, 61, 111):
-                print 'SSH Connection refused, will retry in 5 seconds'
-
 def __deploy_node(subnet_id):
     """
     Deploy instance to specified subnet
     """
-    ami_image_id = env.centos_pv_ami
+    ami_image_id = env.ami
 
     device_mapping = boto.ec2.blockdevicemapping.BlockDeviceMapping()
     for i in xrange(24): # at most 24 devices

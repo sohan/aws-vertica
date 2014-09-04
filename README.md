@@ -20,9 +20,11 @@ Prerequisites
        aws_secret_access_key=<your_key>
 
 ### Other Config
-Move `.fabricrc.sample` to `.fabricrc`, and update the config as follows:
+Copy `.fabricrc.sample` to `.fabricrc`, and update the config as follows:
 
  * `region`: your ec2 region
+ * `ami`: a CentOS 6 AMI either PV or HVM depending on your `instance_type`
+ * `instance_type`: ec2 instance type. take note of whether it supports PV or HVM, and adjust your ami accordingly.
  * `cluster_name`: name you want your cluster tagged as
  * `key_pair`: the name of your ec2 key pair
  * `key_filename`: identity file to ssh into ec2
@@ -30,6 +32,7 @@ Move `.fabricrc.sample` to `.fabricrc`, and update the config as follows:
  * `use_community_edition_license`: 1 or 0, whether to use the community license or not
  * `local_license_path`: local path to your vertica license, that will be copied to your nodes
  * `db_user`, `db_name`, `db_pw`: user, database name, and password for vertica
+ * `vertica_rpm_s3_url`: upload the Vertica rpm you donwloaded from my.vertica.com to s3 and put the s3:// url here.
 
 Commands
 ===========
