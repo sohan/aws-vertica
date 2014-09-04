@@ -27,14 +27,15 @@ else:
 LOCAL_PUBLIC_KEY=env.local_public_key
 CLUSTER_USER="root"
 env.sudo_user = CLUSTER_USER
+env.user = CLUSTER_USER
 DB_USER=env.db_user
 AUTHORIZED_IP_BLOCKS_HTTP=['0.0.0.0/0']
 AUTHORIZED_IP_BLOCKS_SSH=['0.0.0.0/0']
 AUTHORIZED_IP_BLOCKS_DB=['0.0.0.0/0']
 #DB_PATH="/vertica/data"
 #DB_CATALOG="/vertica/data"
-DB_PATH="/vertica/data"
-DB_CATALOG="/vertica/catalog"
+DB_PATH="/mnt/vertica/data"
+DB_CATALOG="/mnt/vertica/catalog"
 
 DB_NAME = env.db_name
 DB_PW = env.db_pw
@@ -290,7 +291,7 @@ def __add_storage_locations(bootstrap_ip):
 def __stitch_cluster(bootstrap_ip):
     user_home=__get_home(CLUSTER_USER)
     run("ssh-keyscan {0} >> {1}/.ssh/known_hosts".format(bootstrap_ip, user_home))
-    sudo("/opt/vertica/sbin/install_vertica --hosts {node_ips} -i {key_path} --dba-user-password {db_pw} --accept-eula --point-to-point --data-dir {data_dir} -L {license_file}".format(
+    sudo("/opt/vertica/sbin/install_vertica --hosts {node_ips} -i {key_path} --dba-user-password {db_pw} --accept-eula --point-to-point --data-dir {data_dir} -L {license_file} --failure-threshold FAIL".format(
         node_ips=bootstrap_ip, 
         db_pw=DB_PW, 
         key_path=CLUSTER_KEY_PATH, 
@@ -304,7 +305,7 @@ def __add_to_existing_cluster(bootstrap_ip, new_node_ips):
         run("ssh-keyscan {0} >> {1}/.ssh/known_hosts".format(ip, user_home))
 
     node_ip_list=','.join(new_node_ips)
-    sudo("/opt/vertica/sbin/install_vertica --add-hosts {node_ips} -i {key_path} --dba-user-password-disabled --point-to-point --data-dir {data_dir}".format(node_ips=node_ip_list, key_path=CLUSTER_KEY_PATH, data_dir=DB_PATH))
+    sudo("/opt/vertica/sbin/install_vertica --add-hosts {node_ips} -i {key_path} --dba-user-password-disabled --point-to-point --data-dir {data_dir} --failure-threshold FAIL".format(node_ips=node_ip_list, key_path=CLUSTER_KEY_PATH, data_dir=DB_PATH))
 
     __set_fabric_env(bootstrap_ip, DB_USER)
 
@@ -542,7 +543,7 @@ def __configure_instance_for_vertica(instance):
         sudo('echo session required pam_limits.so | tee -a /etc/security/limits.conf')
 
     def _readahead():
-        for dev in _get_devices() + ['/dev/xvde']:
+        for dev in _get_devices() + ['/dev/xvde', '/dev/md0']:
             sudo('/sbin/blockdev --setra 2048 {0}'.format(dev))
             sudo('echo /sbin/blockdev --setra 2048 {0} | tee -a /etc/rc.local'.format(dev))
 
@@ -581,9 +582,9 @@ def __configure_instance_for_vertica(instance):
     _manage_users()
     _tz()
     _add_swap_space()
+    _format_disks()
     _readahead()
     _ioscheduler()
-    _format_disks()
     _security_limits()
     _selinux()
     _disable_iptables()
@@ -591,18 +592,23 @@ def __configure_instance_for_vertica(instance):
     _hugepages()
     _awscli_conf()
     _install_rpm()
-    _readahead()
-    _ioscheduler()
 
 def __install_udx_deps(instance):
     __set_fabric_env(instance.ip_address, CLUSTER_USER)
     for pkg in ['gcc-c++', 'curl', 'libcurl-devel']:
         package_ensure_yum(pkg)
 
+def __increase_ssh_connection_limit(instance):
+    __set_fabric_env(instance.ip_address, CLUSTER_USER)
+    sudo("echo MaxStartups 100 | tee -a /etc/ssh/sshd_config")
+    sudo("echo MaxSessions 100 | tee -a /etc/ssh/sshd_config")
+    sudo("service sshd restart")
+
 def install_curl_udl(vpc_id):
     bootstrap = __get_bootstrap_instance(vpc_id=vpc_id)
     __set_fabric_env(bootstrap.ip_address, CLUSTER_USER)
 
+    __increase_ssh_connection_limit(bootstrap)
     __install_udx_deps(bootstrap)
 
     with settings(warn_only=True):
@@ -611,68 +617,13 @@ def install_curl_udl(vpc_id):
     _vsql(bootstrap.private_ip_address, "CREATE LIBRARY curllib as '/opt/vertica/sdk/examples/build/cURLLib.so'")
     _vsql(bootstrap.private_ip_address, "CREATE SOURCE curl AS LANGUAGE 'C++' NAME 'CurlSourceFactory' LIBRARY curllib")
 
-def test_vertica(vpc_id):
-    bootstrap_instance = __get_bootstrap_instance(vpc_id=vpc_id)
-    '''
-    __set_fabric_env(bootstrap_instance.ip_address, CLUSTER_USER)
-    __configure_instance_for_vertica(bootstrap_instance)
-    __copy_ssh_keys(host=bootstrap_instance.ip_address,user=CLUSTER_USER)
-    __setup_vertica(bootstrap=bootstrap_instance)
-
-    __make_cluster_whole(total_nodes=1,vpc_id=vpc_id)
-    '''
-    
-    print "Success!"
-    print "Connect to the bootstrap node:"
-    print "\tssh -i {0} {1}@{2}".format(env.key_filename, "root", bootstrap_instance.ip_address)
-    print "Connect to the database:"
-    print "\tvsql -U {0} -w {1} -h {2} -d {3}".format("dbadmin",DB_PW,bootstrap_instance.ip_address, DB_NAME)
-
-def test_deploy_cluster(total_nodes,  vpc_id=None, eip_allocation_id=None):
-    """Deploy Bootstrap node along with VPC, Subnet and Elastic IP
-       Add nodes to reach specified num_nodes
-       eip_allocation_id : Elastic IP Allocation ID if you want to re-use existing IP
-    """
-    
-    #get or create vpc
-    if not vpc_id:
-        sn_vpc=__create_vpc()
-        subnet=sn_vpc[0]
-        vpc_id=sn_vpc[1].id
-    
-    bootstrap_instance=__get_bootstrap_instance(vpc_id=vpc_id)
-    
-    '''
-    #deploy new bootstrap
-    print "\tInstance : id:{0} private_ip_address:{1}".format(bootstrap_instance.id, bootstrap_instance.private_ip_address)
-    
-    if not eip_allocation_id:
-        print "Creating and assigning elastic ip..."
-        eip_allocation_id=ec2_conn.allocate_address(domain="vpc").allocation_id
-    
-    ec2_conn.associate_address(bootstrap_instance.id, None, eip_allocation_id)
-    eip = ec2_conn.get_all_addresses(allocation_ids=[eip_allocation_id])[0]
-    #TODO: wait on some other thing
-    while not bootstrap_instance.ip_address == eip.public_ip:
-        print "Waiting for ip..."
-        bootstrap_instance.update()
-        time.sleep(10)
-    print "\tElastic Ip: allocation_id:{0} public_ip:{1}".format(eip_allocation_id, bootstrap_instance.ip_address)
-    #print "Waiting additional 45 seconds for safety"
-    #time.sleep(45)
-    #authorize_security_group(vpc_id)
-    #make sure we can access the box
-    #__copy_ssh_keys(host=bootstrap_instance.ip_address,user=CLUSTER_USER)
-    '''
-    #__setup_vertica(bootstrap=bootstrap_instance)
-    __set_fabric_env(bootstrap_instance.ip_address, DB_USER)
-
-    __make_cluster_whole(total_nodes=total_nodes,vpc_id=vpc_id)
-    
-    print "Success!"
-    print "Connect to the bootstrap node:"
-    print "\tssh -i {0} {1}@{2}".format(env.key_filename, "root", bootstrap_instance.ip_address)
-    print "Connect to the database:"
-    print "\tvsql -U {0} -w {1} -h {2} -d {3}".format("dbadmin",DB_PW,bootstrap_instance.ip_address, DB_NAME)
-
+def install_s3cmd(vpc_id):
+    bootstrap = __get_bootstrap_instance(vpc_id=vpc_id)
+    __set_fabric_env(bootstrap.ip_address, CLUSTER_USER)
+    package_ensure_yum('wget')
+    sudo('cd /etc/yum.repos.d/ && wget http://s3tools.org/repo/RHEL_6/s3tools.repo')
+    package_ensure_yum('s3cmd')
+    s3cmd_config = open('scripts/.s3cfg').read().format(access_key=ACCESS_KEY,
+                                                        secret_key=SECRET_KEY)
+    file_write('/root/.s3cfg', s3cmd_config)
 
